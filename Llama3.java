@@ -2,7 +2,7 @@
 //JAVA 21+
 //PREVIEW
 //COMPILE_OPTIONS --add-modules=jdk.incubator.vector
-//RUNTIME_OPTIONS --add-modules=jdk.incubator.vector
+//RUNTIME_OPTIONS --add-modules=jdk.incubator.vector -Djdk.incubator.vector.VECTOR_ACCESS_OOB_CHECK=0
 //MAIN com.llama4j.Llama3
 
 // Practical Llama 3 (and 3.1) inference in a single Java file
@@ -13,24 +13,39 @@
 // Multi-threaded matrix vector multiplication routines implemented using Java's Vector API
 // Simple CLI with --chat and --instruct mode
 //
+// Set system-properties llm.server.host, llm.server.port and llm.server.path to start
+// a HTTP-server which serves llama.cpp-requests (POST-request /completion).
+// llama.server.path should point to a folder which contains HTML-ressources like those in
+// https://github.com/ggerganov/llama.cpp/tree/master/examples/server/public.
+// The system-property llama.server.path is optional to serve a gui in addition
+// to the chat-completion-API using POST requests.
+//
 // To run just:
 // jbang Llama3.java --help
 //
 // Enjoy!
 package com.llama4j;
 
-import jdk.incubator.vector.ByteVector;
-import jdk.incubator.vector.FloatVector;
-import jdk.incubator.vector.VectorOperators;
-import jdk.incubator.vector.VectorSpecies;
+import jdk.incubator.vector.*;
 import sun.misc.Unsafe;
 
+import com.sun.net.httpserver.HttpHandler;
+import com.sun.net.httpserver.HttpServer;
+
+import java.io.BufferedReader;
+import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.io.PrintStream;
+import java.io.Reader;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.lang.reflect.Field;
+import java.math.BigDecimal;
+import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
@@ -41,18 +56,27 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.util.*;
+import java.util.Map.Entry;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.IntConsumer;
 import java.util.function.IntFunction;
+import java.util.function.LongConsumer;
 import java.util.random.RandomGenerator;
 import java.util.random.RandomGeneratorFactory;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
+import java.util.stream.LongStream;
 import java.util.stream.Stream;
 
 public class Llama3 {
+    // Batch-size used in prompt evaluation.
+    private static final int BATCH_SIZE = Integer.getInteger("llama.BatchSize", 16);
 
     static Sampler selectSampler(int vocabularySize, float temperature, float topp, long rngSeed) {
         Sampler sampler;
@@ -91,15 +115,23 @@ public class Llama3 {
         }
         int startPosition = 0;
         Scanner in = new Scanner(System.in);
-        while (true) {
+        loop: while (true) {
             System.out.print("> ");
             System.out.flush();
             String userText = in.nextLine();
-            if (List.of("quit", "exit").contains(userText)) {
-                break;
+            switch (userText) {
+                case "/quit":
+                case "/exit": break loop;
+                case "/context": {
+                    System.out.printf("%d out of %d context tokens used (%d tokens remaining)%n",
+                            conversationTokens.size(),
+                            options.maxTokens(),
+                            options.maxTokens() - conversationTokens.size());
+                    continue;
+                }
             }
             if (state == null) {
-                state = model.createNewState();
+                state = model.createNewState(BATCH_SIZE);
             }
             conversationTokens.addAll(chatFormat.encodeMessage(new ChatFormat.Message(ChatFormat.Role.USER, userText)));
             conversationTokens.addAll(chatFormat.encodeHeader(new ChatFormat.Message(ChatFormat.Role.ASSISTANT, "")));
@@ -131,7 +163,7 @@ public class Llama3 {
     }
 
     static void runInstructOnce(Llama model, Sampler sampler, Options options) {
-        Llama.State state = model.createNewState();
+        Llama.State state = model.createNewState(BATCH_SIZE);
         ChatFormat chatFormat = new ChatFormat(model.tokenizer());
 
         List<Integer> promptTokens = new ArrayList<>();
@@ -158,6 +190,788 @@ public class Llama3 {
             System.out.println(responseText);
         }
     }
+
+    record LlamaHttpSession(String sessionKey, Llama model, Sampler sampler, Options options, Llama.State state, List<Integer> conversationTokens) { ; }
+
+    static enum JsonFormat {
+        LLAMA_CPP,
+        OPENAI
+    }
+
+    /**
+     * Starts a HTTP-server to server requests in Llama.cpp-style.
+     * @param model model
+     * @param sampler sampler
+     * @param optionsGlobal default options
+     * @param host host-name or ip-address to bind the http-server
+     * @param port port of http-server
+     */
+    static void runHttpServer(Llama model, Sampler sampler, Options optionsGlobal, String host, int port) {
+        InetSocketAddress addr = new InetSocketAddress(host, port);
+        int backlog = 0;
+        String rootpath = "/";
+        System.out.println(String.format("Start server at %s", addr));
+        final AtomicLong reqCounter = new AtomicLong();
+        final ConcurrentMap<String, LlamaHttpSession> mapSessions = new ConcurrentHashMap<>();
+
+        AtomicReference<HttpServer> refServer = new AtomicReference<>();
+        HttpHandler handler = exchange -> {
+            System.out.format("httpserver: request of %s by %s%n", exchange.getRequestURI(), exchange.getRemoteAddress());
+            if ("GET".equals(exchange.getRequestMethod())) {
+                String pathReq = exchange.getRequestURI().getPath();
+                String pathBase = System.getProperty("llm.server.path", "public");
+                if ("/".equals(pathReq)) {
+                    pathReq = "index.html";
+                }
+                if (!Pattern.matches("/?[A-Za-z0-9_.-]*", pathReq)) {
+                    System.err.format("Invalid path: %s%n", pathReq);
+                    byte[] buf = "Invalid path".getBytes(StandardCharsets.UTF_8);
+                    exchange.setAttribute("Content-Type", "application/html");
+                    exchange.sendResponseHeaders(404, buf.length);
+                    exchange.getResponseBody().write(buf);
+                    exchange.close();
+                    return;
+                }
+                final File file = new File(pathBase, pathReq);
+                if (!file.isFile()) {
+                    System.err.println("No such file: " + file);
+                    byte[] buf = "File not found".getBytes(StandardCharsets.UTF_8);
+                    exchange.setAttribute("Content-Type", "application/html");
+                    exchange.sendResponseHeaders(404, buf.length);
+                    exchange.getResponseBody().write(buf);
+                    exchange.close();
+                    return;
+                }
+                exchange.getRequestBody().close();
+                String contentType = switch (pathReq.replaceFirst(".*[.]", "")) {
+                    case "html" -> "text/html";
+                    case "css" -> "text/css";
+                    case "js", "mjs" -> "text/javascript";
+                    case "ico" -> "image";
+                    default -> "application/octet-stream";
+                };
+                exchange.getResponseHeaders().set("Content-type", contentType);
+                byte[] buf = Files.readAllBytes(file.toPath());
+                exchange.sendResponseHeaders(200, buf.length);
+                try (OutputStream os = exchange.getResponseBody()) {
+                    os.write(buf);
+                }
+                exchange.close();
+                return;
+            }
+            List<ChatFormat.Message> chatMessages = new ArrayList<>();
+            final Map<String, Object> mapRequest;
+            try (InputStream is = exchange.getRequestBody();
+                    InputStreamReader isr = new InputStreamReader(is);
+                    BufferedReader br = new BufferedReader(isr);
+                    TeeBufferedReader tbr = new TeeBufferedReader(br)) {
+                try {
+                    readChar(tbr, true, '{');
+                    mapRequest = parseJsonDict(tbr);
+
+                    List<Map<String, Object>> messages = getJsonArrayDicts(mapRequest, "messages");
+                    String prompt = getJsonValue(mapRequest, "prompt", String.class);
+                    if (prompt != null) {
+                        // llama.cpp chat sends the whole chat as a long string :-/.
+                        Pattern pLlamaCppChatDefault = Pattern.compile(".*\nUser: (.*)\nLlama:", Pattern.DOTALL);
+                        Matcher m = pLlamaCppChatDefault.matcher(prompt);
+                        if (m.matches()) {
+                            prompt = m.group(1);
+                        }
+                    }
+
+                    String systemPrompt = optionsGlobal.systemPrompt();
+                    if (messages != null) {
+                        for (Map<String, Object> msg : messages) {
+                            String role = getJsonValue(msg, "role", String.class);
+                            String content = getJsonValue(msg, "content", String.class);
+                            if (role == null) {
+                                throw new IllegalArgumentException("role is missing in incoming message.");
+                            }
+                            if (content == null) {
+                                throw new IllegalArgumentException("content is missing in incoming message.");
+                            }
+                            if ("system".equals(role)) {
+                                if (systemPrompt != null) {
+                                    throw new IllegalArgumentException("Can't overwrite system-prompt.");
+                                }
+                                systemPrompt = content;
+                            }
+                            else if ("user".equals(role)) {
+                                prompt = content;
+                            }
+                            else {
+                                throw new IllegalArgumentException("Unexpected role in message: " + role);
+                            }
+                        }
+                    }
+                    if (prompt == null) {
+                        System.out.println("Map: " + mapRequest);
+                        throw new IllegalArgumentException("Prompt is missing in request");
+                    }
+                    if ("STOP".equalsIgnoreCase(prompt)) {
+                        refServer.get().stop(0);
+                        throw new IllegalArgumentException("Server is stopping");
+                    }
+                    if (systemPrompt != null) {
+                        chatMessages.add(new ChatFormat.Message(ChatFormat.Role.SYSTEM, systemPrompt));
+                    }
+                    chatMessages.add(new ChatFormat.Message(ChatFormat.Role.USER, prompt));
+                }
+                catch (RuntimeException e) {
+                    System.out.println("JSON-Prefix: " + tbr.sb);
+                    e.printStackTrace();
+                    Map<String, Object> mapError = new HashMap<>();
+                    mapError.put("errormsg", "Invalid request: " + e.getMessage());
+                    mapError.put("jsonProcessed", tbr.sb.toString());
+                    var sb = new StringBuilder();
+                    dumpJson(sb, mapError);
+                    byte[] bufError = sb.toString().getBytes(StandardCharsets.UTF_8);
+                    exchange.sendResponseHeaders(400, bufError.length);
+                    exchange.setAttribute("Content-Type", "application/json");
+                    exchange.getResponseBody().write(bufError);
+                    exchange.close();
+                    return;
+                }
+            }
+            catch (IOException e) {
+                e.printStackTrace();
+                exchange.sendResponseHeaders(500, 0);
+                exchange.close();
+                return;
+            }
+
+            JsonFormat format = mapRequest.containsKey("messages" ) ? JsonFormat.OPENAI : JsonFormat.LLAMA_CPP;
+
+            try {
+                List<String> lCookies = exchange.getRequestHeaders().get("Cookie");
+                String cookie = (lCookies != null) ? lCookies.get(0) : null;
+                Llama3.LlamaHttpSession httpSession = null;
+                {
+                    String sessionKey = null;
+                    if (cookie != null && cookie.startsWith("LLAMA_SESS_ID=")) {
+                        sessionKey = cookie.replaceFirst("LLAMA_SESS_ID=([^;]*).*", "$1");
+                        httpSession = mapSessions.get(sessionKey);
+                        if (httpSession == null) {
+                            System.err.format("Llama-HTTP-session (%s) doesn't exist (any more)%n", sessionKey);
+                            sessionKey = null;
+                        }
+                    }
+                    if (httpSession != null && httpSession.conversationTokens().size() > 0) {
+                        if (ChatFormat.Role.SYSTEM.equals(chatMessages.get(0).role())) {
+                            // System-prompt at begin only.
+                            chatMessages.remove(0);
+                        }
+                    }
+                    if (httpSession == null) {
+                        // We build a new HTTP-session.
+                        final Llama.State state = model.createNewState(BATCH_SIZE);
+                        sessionKey = "SESS-" + reqCounter.get() + "-" + UUID.randomUUID().toString();
+                        exchange.getResponseHeaders().add("Set-Cookie", "LLAMA_SESS_ID=" + sessionKey);
+
+                        float temperature = readFloat(mapRequest, "temperature", optionsGlobal.temperature());
+                        float topP = readFloat(mapRequest, "top_p", optionsGlobal.topp());
+                        int maxLlamaCpp = readInt(mapRequest, "n_predict", optionsGlobal.maxTokens());
+                        int maxTokensOld = readInt(mapRequest, "max_tokens", maxLlamaCpp);
+                        int maxComplTokens = readInt(mapRequest, "max_completion_tokens", maxTokensOld);
+                        long seed = readLong(mapRequest, "seed", optionsGlobal.seed());
+                        boolean stream = readBoolean(mapRequest, "stream", optionsGlobal.stream());
+                        Options optionsReq = new Options(optionsGlobal.modelPath(), "", optionsGlobal.systemPrompt(), true,
+                                temperature, topP, seed, maxComplTokens, stream, optionsGlobal.echo());
+                        System.out.format("New HTTP-Session (%s) for (%s), temp=%f, top_p=%f, n=%d, seed=%d%n", sessionKey, exchange.getRemoteAddress(),
+                                temperature, topP, maxComplTokens, seed);
+                        final List<Integer> conversationTokens = new ArrayList<>();
+                        httpSession = new LlamaHttpSession(sessionKey, model, sampler, optionsReq, state, conversationTokens);
+                        mapSessions.put(sessionKey, httpSession);
+                    }
+                }
+                final String sessionKey = httpSession.sessionKey();
+                final Llama3.Options options = httpSession.options();
+                final List<Integer> conversationTokens = httpSession.conversationTokens();
+                int startPosition = conversationTokens.size();
+
+                ChatFormat chatFormat = new ChatFormat(model.tokenizer());
+                chatMessages.stream().map(m -> String.format("[%s]> %s", m.role(), m.content())).forEach(System.out::println);
+                chatMessages.stream().map(chatFormat::encodeMessage).forEach(conversationTokens::addAll);
+                conversationTokens.addAll(chatFormat.encodeHeader(new ChatFormat.Message(ChatFormat.Role.ASSISTANT, "")));
+                //System.out.format("Tokens (start-pos %d): %s%n", startPosition, conversationTokens);
+                //System.out.println("Text: " + model.tokenizer().decode(conversationTokens).replace("\n", "\\n"));
+                Set<Integer> stopTokens = chatFormat.getStopTokens();
+
+                if (options.stream()) {
+                    // We use server-side events (SSE) for streaming.
+                    exchange.getResponseHeaders().add("Content-Type", "text/event-stream");
+                    exchange.getResponseHeaders().add("Cache-Control", "no-cache");
+                    exchange.sendResponseHeaders(200, 0);
+                }
+
+                final long tsCreation = System.currentTimeMillis();
+                List<Integer> responseTokens = Llama.generateTokens(model, httpSession.state(), startPosition, conversationTokens.subList(startPosition, conversationTokens.size()), stopTokens, options.maxTokens(), sampler, options.echo(), token -> {
+                    if (options.stream()) {
+                        if (!model.tokenizer().isSpecialToken(token)) {
+                            String sToken = model.tokenizer().decode(List.of(token));
+                            System.out.print(sToken);
+
+                            Integer stopToken = null;
+                            Map<String, Object> mapResponse = createResponse(model, reqCounter, format, tsCreation,
+                                    stopToken, true, sToken);
+
+                            var sbOut = new StringBuilder();
+                            dumpJson(sbOut, mapResponse);
+                            byte[] buf = String.format("data: %s\n\n", sbOut).getBytes(StandardCharsets.UTF_8);
+                            try {
+                                exchange.getResponseBody().write(buf);
+                                exchange.getResponseBody().flush();
+                            } catch (IOException e) {
+                                System.err.format("%nRemove session (%s)%n", sessionKey);
+                                mapSessions.remove(sessionKey);
+                                throw new IllegalStateException("IO-error while sending response", e);
+                            }
+                        }
+                    }
+                });
+                // Include stop token in the prompt history, but not in the response displayed to the user.
+                conversationTokens.addAll(responseTokens);
+                startPosition = conversationTokens.size();
+                Integer stopToken = null;
+                if (!responseTokens.isEmpty() && stopTokens.contains(responseTokens.getLast())) {
+                    stopToken = responseTokens.getLast();
+                    responseTokens.removeLast();
+                }
+                String responseText = "";
+                if (!options.stream()) {
+                    responseText = model.tokenizer().decode(responseTokens);
+                    System.out.println(responseText);
+                }
+                Map<String, Object> mapResponse = createResponse(model, reqCounter, format, tsCreation,
+                        stopToken, options.stream(), responseText);
+                if (stopToken == null) {
+                    System.err.println("Ran out of context length...");
+                }
+                var sbOut = new StringBuilder();
+                dumpJson(sbOut, mapResponse);
+                byte[] buf;
+                if (options.stream()) {
+                    buf = String.format("data: %s\n\n", sbOut).getBytes(StandardCharsets.UTF_8);
+                } else {
+                    buf = String.format("%s\n", sbOut).getBytes(StandardCharsets.UTF_8);
+                    exchange.getResponseHeaders().add("Content-Type", "text/event-stream");
+                    exchange.sendResponseHeaders(200, buf.length);
+                }
+                exchange.getResponseBody().write(buf);
+                exchange.close();
+            } catch (Exception e) {
+                System.err.println("Error while creating response: " + e.getMessage());
+                e.printStackTrace();
+
+                Map<String, Object> mapError = new HashMap<>();
+                mapError.put("errormsg", "Error while creating response");
+                var sb = new StringBuilder();
+                dumpJson(sb, mapError);
+                byte[] bufError = sb.toString().getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(400, bufError.length);
+                exchange.setAttribute("Content-Type", "application/json");
+                exchange.getResponseBody().write(bufError);
+                exchange.close();
+            }
+        };
+        try {
+            final HttpServer server = HttpServer.create(addr, backlog, rootpath, handler);
+            refServer.set(server);
+            server.start();
+        } catch (IOException e) {
+            e.printStackTrace();
+            System.err.println("Couldn't start LLM-server");
+        }
+    }
+
+    private static Map<String, Object> createResponse(Llama model, final AtomicLong reqCounter,
+            JsonFormat format, final long tsCreation, Integer stopToken,
+            boolean isDelta, String responseText) {
+        Map<String, Object> mapResponse = new LinkedHashMap<>();
+        switch (format) {
+        case LLAMA_CPP:
+            mapResponse.put("content", responseText);
+            mapResponse.put("stop", Boolean.valueOf(stopToken != null));
+            break;
+        case OPENAI:
+            createResponseOpenAI(model, reqCounter, tsCreation, stopToken,
+                    mapResponse, isDelta, responseText);
+            break;
+        default:
+            throw new IllegalArgumentException("format " + format);
+        }
+        return mapResponse;
+    }
+
+    private static void createResponseOpenAI(Llama model, final AtomicLong reqCounter,
+            final long tsCreation, Integer stopToken,
+            Map<String, Object> mapResponse, boolean isDelta, String content) {
+        mapResponse.put("id", "cc-" + reqCounter.incrementAndGet());
+        mapResponse.put("object", "chat.completion");
+        mapResponse.put("created", Long.toString(tsCreation / 1000L));
+        mapResponse.put("model", model.modelName());
+        List<Object> choices = new ArrayList<>();
+        Map<String, Object> choice0 = new LinkedHashMap<>();
+        choice0.put("index", "0");
+        Map<String, Object> respMsg = new LinkedHashMap<>();
+        respMsg.put("role", "assistant");
+        respMsg.put("content", content);
+        choice0.put(isDelta ? "delta" : "message", respMsg);
+        choice0.put("logprobs", null);
+        String finishReason = null;
+        if (!isDelta) {
+            finishReason = (stopToken == null) ? "length" : "stop";
+        }
+        choice0.put("finishReason", finishReason);
+        choices.add(choice0);
+        mapResponse.put("choices", choices);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void dumpJson(StringBuilder sb, Map<String, Object> map) {
+        sb.append('{');
+        String as = "";
+        for (Entry<String, Object> entry : map.entrySet()) {
+            sb.append(as);
+            dumpString(sb, entry.getKey());
+            sb.append(':');
+            var value = entry.getValue();
+            if (value == null) {
+                sb.append("null");
+            }
+            else if (value instanceof String s) {
+                dumpString(sb, s);
+            }
+            else if (value instanceof List) {
+                dumpJson(sb, (List<Object>) value);
+            }
+            else if (value instanceof Map) {
+                dumpJson(sb, (Map<String, Object>) value);
+            }
+            else if (value instanceof Boolean b) {
+                sb.append(b);
+            }
+            else {
+                throw new IllegalArgumentException("Unexpected value of type " + value.getClass());
+            }
+            as = ",";
+        }
+        sb.append('}');
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void dumpJson(StringBuilder sb, List<Object> list) {
+        sb.append('[');
+        String as = "";
+        for (Object value : list) {
+            sb.append(as);
+            if (value == null) {
+                sb.append("null");
+            }
+            else if (value instanceof String s) {
+                dumpString(sb, s);
+            }
+            else if (value instanceof List) {
+                sb.append(value);
+            }
+            else if (value instanceof Map) {
+                dumpJson(sb, (Map<String, Object>) value);
+            }
+            else if (value instanceof Boolean b) {
+                sb.append(b);
+            }
+            else {
+                throw new IllegalArgumentException("Unexpected value of type " + value.getClass());
+            }
+            as = ",";
+        }
+        sb.append(']');
+    }
+
+    private static void dumpString(StringBuilder sb, String s) {
+        sb.append('"');
+        for (int i = 0; i < s.length(); i++) {
+            final char c = s.charAt(i);
+            if (c == '"') {
+                sb.append("\\\"");
+            } else if ((c >= ' ' && c < 0x7f) || (c >= 0xa1 && c <= 0xff)) {
+                sb.append(c);
+            } else if (c == '\n') {
+                sb.append("\\n");
+            } else if (c == '\r') {
+                sb.append("\\r");
+            } else if (c == '\t') {
+                sb.append("\\t");
+            } else {
+                sb.append("\\u");
+                final String sHex = Integer.toHexString(c);
+                for (int j = sHex.length(); j < 4; j++) {
+                    sb.append('0');
+                }
+                sb.append(sHex);
+            }
+        }
+        sb.append('"');
+    }
+
+    static class TeeBufferedReader extends BufferedReader {
+        final StringBuilder sb = new StringBuilder();
+        /**
+         * Constructor
+         * @param in stream to be copied and read
+         */
+        public TeeBufferedReader(Reader in) {
+            super(in);
+        }
+
+        public int read() throws IOException {
+            int c = super.read();
+            if (c >= 0) {
+                sb.append((char) c);
+            }
+            return c;
+        }
+    }
+
+    private static List<Object> parseJsonArray(BufferedReader br) throws IOException {
+        // The '[' has been read already.
+        List<Object> list = new ArrayList<>();
+        boolean needComma = false;
+        while (true) {
+            char c = readChar(br, true);
+            if (c == ']') {
+                break;
+            }
+            if (needComma) {
+                if (c != ',') {
+                    throw new IllegalArgumentException(String.format("Missing comma but (%c), list: %s", c, list));
+                }
+                c = readChar(br, true);
+            }
+            Object value;
+            if (c == '"') {
+                value = readString(br);
+            }
+            else if (c == '{') {
+                value = parseJsonDict(br);
+            }
+            else if (c == '[') {
+                value = parseJsonArray(br);
+            }
+            else {
+                var sb = new StringBuilder();
+                while (true) {
+                    if (c == '}' || c == ',') {
+                        break;
+                    }
+                    if ((c >= 'a' && c <= 'z') || (c == 'E') || (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '+') {
+                        sb.append(c);
+                        c = readChar(br, false);
+                    } else {
+                        throw new IllegalArgumentException("Illegal value character: " + c);
+                    }
+                }
+                if (sb.length() == 0) {
+                    throw new IllegalArgumentException("Missing value");
+                }
+                value = parseJsonValue(sb.toString());
+            }
+            list.add(value);
+            needComma = (c != ',');
+        }
+        return list;
+    }
+
+    /**
+     * This is a simple (not complete, but without dependency) JSON-parser used to parse llama.cpp-responses.
+     * Use a parser of https://json.org/ to get a complete implementation.
+     * @param br reader containing a JSON document
+     * @return map from key to value
+     * @throws IOException in case of an IO error
+     */
+    private static Map<String, Object> parseJsonDict(BufferedReader br) throws IOException {
+        // The '{' has been read already.
+        Map<String, Object> map = new LinkedHashMap<>();
+        boolean needComma = false;
+        while (true) {
+            char c;
+            try {
+                c = readChar(br, true);
+            } catch (IllegalArgumentException e) {
+                System.err.println("Map(part): " + map);
+                throw e;
+            }
+            if (c == '}') {
+                break;
+            }
+            if (needComma) {
+                if (c != ',') {
+                    throw new IllegalArgumentException("Missing comma: " + c);
+                }
+                c = readChar(br, true);
+            }
+            if (c != '"') {
+                throw new IllegalArgumentException("Illegal key: " + c);
+            }
+            String key = readString(br);
+            c = readChar(br, true);
+            if (c != ':') {
+                throw new IllegalArgumentException("Illegal character after key: " + c);
+            }
+            c = readChar(br, true);
+            Object value;
+            if (c == '"') {
+                value = readString(br);
+            }
+            else if (c == '{') {
+                value = parseJsonDict(br);
+            }
+            else if (c == '[') {
+                value = parseJsonArray(br);
+            }
+            else {
+                var sb = new StringBuilder();
+                while (true) {
+                    if (c == '}' || c == ',') {
+                        break;
+                    }
+                    if ((c >= 'a' && c <= 'z') || (c == 'E') || (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '+') {
+                        sb.append(c);
+                        c = readChar(br, false);
+                    } else if ((c == ' ' || c == '\t' || c == '\r' || c == '\n')) {
+                        break;
+                    } else {
+                        throw new IllegalArgumentException(String.format("Illegal value character (\\u%04x, '%c')", (int) c, c));
+                    }
+                }
+                if (sb.length() == 0) {
+                    throw new IllegalArgumentException("Missing value of key " + key);
+                }
+                value = parseJsonValue(sb.toString());
+                if (c == '}') {
+                    map.put(key, value);
+                    break;
+                }
+            }
+            map.put(key, value);
+            needComma = (c != ',');
+        }
+        return map;
+    }
+
+    private static Object parseJsonValue(String value) {
+        if ("null".equals(value)) {
+            return null;
+        }
+        if ("true".equals(value)) {
+            return Boolean.TRUE;
+        }
+        if ("false".equals(value)) {
+            return Boolean.FALSE;
+        }
+        // value has to be a JSON-number.
+        BigDecimal bd = new BigDecimal(value); // We accept some more values, e.g. "+5" instead of "5".
+        if (bd.scale() == 0 && BigDecimal.valueOf(Integer.MAX_VALUE).compareTo(bd) >= 0
+                && BigDecimal.valueOf(Integer.MIN_VALUE).compareTo(bd) <= 0) {
+            return Integer.valueOf(bd.intValueExact());
+        }
+        return bd;
+    }
+
+    /**
+     * Gets a JSON-value, if it exists.
+     * @param <V> type of the expected value
+     * @param map JSON-dictionary
+     * @param key key
+     * @param clazz class of the expected value
+     * @return value or <code>null</code>
+     */
+    @SuppressWarnings("unchecked")
+    static <V> V getJsonValue(Map<String, Object> map, String key, Class<V> clazz) {
+        Object o = map.get(key);
+        if (o == null) {
+            return null;
+        }
+        if (clazz.isInstance(o)) {
+            return (V) o;
+        }
+        throw new IllegalArgumentException(String.format("Unexpeted value-type (%s) of value (%s) at key (%s)", o.getClass(), o, key));
+    }
+
+    /**
+     * Gets a JSON-array, if it exists.
+     * @param map JSON-dictionary
+     * @param key key
+     * @return JSON-array or <code>null</code>
+     */
+    @SuppressWarnings("unchecked")
+    static List<Object> getJsonArray(Map<String, Object> map, String key) {
+        Object o = map.get(key);
+        if (o == null) {
+            return null;
+        }
+        if (!(o instanceof List)) {
+            throw new IllegalArgumentException(String.format("Unexpected value-type (%s) of value (%s) at key (%s), expected json-array", o.getClass(), o, key));
+        }
+        return (List<Object>) o;
+    }
+
+    /**
+     * Gets a JSON-array of dictionaries, if it exists.
+     * @param map JSON-dictionary
+     * @param key key
+     * @return JSON-array or <code>null</code>
+     */
+    @SuppressWarnings("unchecked")
+    static List<Map<String, Object>> getJsonArrayDicts(Map<String, Object> map, String key) {
+        List<Object> listObj = getJsonArray(map, key);
+        if (listObj == null) {
+            return null;
+        }
+        for (Object o : listObj) {
+            if (!(o instanceof Map)) {
+                throw new IllegalArgumentException(String.format("Unexpected value-type (%s) of value (%s) in list of key (%s), expected json-array with dictionaries", o.getClass(), o, key));
+            }
+        }
+        return (List<Map<String, Object>>) (Object) listObj;
+    }
+
+    private static String readString(BufferedReader br) throws IOException {
+        var sb = new StringBuilder();
+        while (true) {
+            char c = readChar(br, false);
+            if (c == '"') {
+                break;
+            }
+            if (c == '\\') {
+                c = readChar(br, false);
+                if (c == '"') {
+                    ;
+                }
+                else if (c == 't') {
+                    c = '\t';
+                }
+                else if (c == 'n') {
+                    c = '\n';
+                }
+                else if (c == 'r') {
+                    c = '\r';
+                }
+                else if (c == 'b') {
+                    c = '\b';
+                }
+                else if (c == 'f') {
+                    c = '\f';
+                }
+                else if (c == '/') {
+                    ;
+                }
+                else if (c == 'u') {
+                    char[] cBuf = new char[4];
+                    for (int i = 0; i < 4; i++) {
+                        cBuf[i] = readChar(br, false);
+                    }
+                    try {
+                        c = (char) Integer.parseInt(new String(cBuf), 16);
+                    } catch (NumberFormatException e) {
+                        throw new IllegalArgumentException("Unexpected unicode-escape: " + new String(cBuf));
+                    }
+                }
+                else {
+                    throw new IllegalArgumentException("Unexpected escape character: " + c);
+                }
+                sb.append(c);
+                continue;
+            }
+            sb.append(c);
+        }
+        return sb.toString();
+    }
+
+    private static char readChar(BufferedReader br, boolean ignoreWS) throws IOException {
+        while (true) {
+            int c = br.read();
+            if (c == -1) {
+                throw new IllegalArgumentException("Unexpected end of stream");
+            }
+            if (ignoreWS && (c == ' ' || c == '\t' || c == '\r' || c == '\n')) {
+                continue;
+            }
+            return (char) c;
+        }
+    }
+
+    private static void readChar(BufferedReader br, boolean ignoreWS, char expected) throws IOException {
+        while (true) {
+            int c = br.read();
+            if (c == -1) {
+                throw new IllegalArgumentException(String.format("Unexpected end of stream, expected '%c', U+%04x", expected, (int) expected));
+            }
+            if (ignoreWS && (c == ' ' || c == '\t' || c == '\r' || c == '\n')) {
+                continue;
+            }
+            if (c == expected) {
+                break;
+            }
+            throw new IllegalArgumentException(String.format("Unexpected character '%c' (0x%04x) instead of '%c'",
+                        c, c, expected));
+        }
+    }
+
+    private static float readFloat(Map<String, Object> map, String key, float defaultValue) {
+        Object oValue = map.get(key);
+        if (oValue == null) {
+            return defaultValue;
+        }
+        if (oValue instanceof Integer iValue) {
+            return iValue;
+        }
+        if (oValue instanceof BigDecimal bd) {
+            return bd.floatValue();
+        }
+        throw new IllegalStateException(String.format("Unexpected type (%s / %s) at key (%s), expected float", oValue.getClass(), oValue, key));
+    }
+
+    private static int readInt(Map<String, Object> map, String key, int defaultValue) {
+        Object oValue = map.get(key);
+        if (oValue == null) {
+            return defaultValue;
+        }
+        if (oValue instanceof Integer iValue) {
+            return iValue;
+        }
+        if (oValue instanceof BigDecimal bd) {
+            return bd.intValueExact();
+        }
+        throw new IllegalStateException(String.format("Unexpected type (%s / %s) at key (%s), expected int", oValue.getClass(), oValue, key));
+    }
+
+    private static long readLong(Map<String, Object> map, String key, long defaultValue) {
+        Object oValue = map.get(key);
+        if (oValue == null) {
+            return defaultValue;
+        }
+        if (oValue instanceof Integer iValue) {
+            return iValue;
+        }
+        if (oValue instanceof BigDecimal bd) {
+            return bd.longValueExact();
+        }
+        throw new IllegalStateException(String.format("Unexpected type (%s / %s) at key (%s), expected long", oValue.getClass(), oValue, key));
+    }
+
+    private static boolean readBoolean(Map<String, Object> map, String key, boolean defaultValue) {
+        Object oValue = map.get(key);
+        if (oValue == null) {
+            return defaultValue;
+        }
+        if (oValue instanceof Boolean bValue) {
+            return bValue;
+        }
+        throw new IllegalStateException(String.format("Unexpected type (%s / %s) at key (%s), expected boolean", oValue.getClass(), oValue, key));
+    }
+
 
     record Options(Path modelPath, String prompt, String systemPrompt, boolean interactive,
                    float temperature, float topp, long seed, int maxTokens, boolean stream, boolean echo) {
@@ -265,7 +1079,11 @@ public class Llama3 {
             model = ModelLoader.loadModel(options.modelPath(), options.maxTokens(), true);
         }
         Sampler sampler = selectSampler(model.configuration().vocabularySize, options.temperature(), options.topp(), options.seed());
-        if (options.interactive()) {
+        String host = System.getProperty("llm.server.host");
+        int port = Integer.parseInt(System.getProperty("llm.server.port", "8089"));
+        if (host != null) {
+            runHttpServer(model, sampler, options, host, port);
+        } else  if (options.interactive()) {
             runInteractive(model, sampler, options);
         } else {
             runInstructOnce(model, sampler, options);
@@ -674,10 +1492,10 @@ final class ModelLoader {
     public static Llama loadModel(Path ggufPath, int contextLength, boolean loadWeights) throws IOException {
         GGUF gguf = GGUF.loadModel(ggufPath);
         FileChannel fileChannel = FileChannel.open(ggufPath, StandardOpenOption.READ);
-        return loadModel(fileChannel, gguf, contextLength, loadWeights);
+        return loadModel(ggufPath, fileChannel, gguf, contextLength, loadWeights);
     }
 
-    public static Llama loadModel(FileChannel fileChannel, GGUF gguf, int contextLength, boolean loadWeights) throws IOException {
+    public static Llama loadModel(Path ggufPath, FileChannel fileChannel, GGUF gguf, int contextLength, boolean loadWeights) throws IOException {
         try (var ignored = Timer.log("Load LlaMa model")) {
             Map<String, Object> metadata = gguf.getMetadata();
             Vocabulary vocabulary = loadVocabulary(metadata);
@@ -704,7 +1522,7 @@ final class ModelLoader {
                 Map<String, GGMLTensorEntry> tensorEntries = GGUF.loadTensors(fileChannel, gguf.getTensorDataOffset(), gguf.getTensorInfos());
                 weights = loadWeights(tensorEntries, config);
             }
-            return new Llama(config, tokenizer, weights);
+            return new Llama(ggufPath.getFileName().toString().replaceFirst("[.]gguf$", ""), config, tokenizer, weights);
         }
     }
 
@@ -805,9 +1623,9 @@ final class ModelLoader {
     }
 }
 
-record Llama(Configuration configuration, Tokenizer tokenizer, Weights weights) {
-    public State createNewState() {
-        State state = new State(configuration());
+record Llama(String modelName, Configuration configuration, Tokenizer tokenizer, Weights weights) {
+    public State createNewState(int batchsize) {
+        State state = new State(configuration(), batchsize);
         state.latestToken = tokenizer.getSpecialTokens().get("<|begin_of_text|>");
         return state;
     }
@@ -889,37 +1707,51 @@ record Llama(Configuration configuration, Tokenizer tokenizer, Weights weights) 
     public static final class State {
 
         // current wave of activations
-        public final FloatTensor x; // activation at current time stamp (dim,)
-        public final FloatTensor xb; // same, but inside a residual branch (dim,)
-        public final FloatTensor xb2; // an additional buffer just for convenience (dim,)
-        public final FloatTensor hb; // buffer for hidden dimension in the ffn (hidden_dim,)
-        public final FloatTensor hb2; // buffer for hidden dimension in the ffn (hidden_dim,)
-        public final FloatTensor q; // query (dim,)
-        public final FloatTensor k; // key (dim,)
-        public final FloatTensor v; // value (dim,)
-        public final FloatTensor att; // buffer for scores/attention values (n_heads, seq_len)
+        public final int batchsize;
+        public final FloatTensor[] x; // activation at current time stamp (dim,)
+        public final FloatTensor[] xb; // same, but inside a residual branch (dim,)
+        public final FloatTensor[] xb2; // an additional buffer just for convenience (dim,)
+        public final FloatTensor[] hb; // buffer for hidden dimension in the ffn (hidden_dim,)
+        public final FloatTensor[] hb2; // buffer for hidden dimension in the ffn (hidden_dim,)
+        public final FloatTensor[] q; // query (dim,)
+        public final FloatTensor[] k; // key (dim,)
+        public final FloatTensor[] v; // value (dim,)
+        public final FloatTensor[] att; // buffer for scores/attention values (n_heads, seq_len)
         public final FloatTensor logits; // output logits
+
         // kv cache
         public final FloatTensor[] keyCache;   // (n_layer, seq_len, kv_dim)
         public final FloatTensor[] valueCache; // (n_layer, seq_len, kv_dim)
+        
+        /** last index in previous block */
+        int idxPrevBlock;
 
         public int latestToken;
 
-        State(Configuration config) {
-            this.x = ArrayFloatTensor.allocate(config.dim);
-            this.xb = ArrayFloatTensor.allocate(config.dim);
-            this.xb2 = ArrayFloatTensor.allocate(config.dim);
-            this.hb = ArrayFloatTensor.allocate(config.hiddenDim);
-            this.hb2 = ArrayFloatTensor.allocate(config.hiddenDim);
-            this.q = ArrayFloatTensor.allocate(config.dim);
-            this.k = ArrayFloatTensor.allocate(config.dim);
-            this.v = ArrayFloatTensor.allocate(config.dim);
-            this.att = ArrayFloatTensor.allocate(config.numberOfHeads, config.contextLength);
+        State(Configuration config, int batchsize) {
+            this.batchsize = batchsize;
+            this.x = allocate(batchsize, config.dim);
+            this.xb = allocate(batchsize, config.dim);
+            this.xb2 = allocate(batchsize, config.dim);
+            this.hb = allocate(batchsize, config.hiddenDim);
+            this.hb2 = allocate(batchsize, config.hiddenDim);
+            this.q = allocate(batchsize, config.dim);
+            this.k = allocate(batchsize, config.dim);
+            this.v = allocate(batchsize, config.dim);
+            this.att = allocate(batchsize, config.numberOfHeads, config.contextLength);
+            idxPrevBlock = -1;
+
             this.logits = ArrayFloatTensor.allocate(config.vocabularySize);
             int kvDim = (config.dim * config.numberOfKeyValueHeads) / config.numberOfHeads;
             this.keyCache = Stream.generate(() -> ArrayFloatTensor.allocate(config.contextLength, kvDim)).limit(config.numberOfLayers).toArray(FloatTensor[]::new);
             this.valueCache = Stream.generate(() -> ArrayFloatTensor.allocate(config.contextLength, kvDim)).limit(config.numberOfLayers).toArray(FloatTensor[]::new);
         }
+    }
+
+    static FloatTensor[] allocate(int numTokens, int... dims) {
+        return IntStream.range(0, numTokens)
+                .mapToObj(i -> ArrayFloatTensor.allocate(dims))
+                .toArray(FloatTensor[]::new);
     }
 
     static void rmsnorm(FloatTensor out, FloatTensor x, FloatBuffer weight, int size, float rmsNormEps) {
@@ -933,7 +1765,7 @@ record Llama(Configuration configuration, Tokenizer tokenizer, Weights weights) 
         out.mapWithIndexInPlace(0, size, (value, index) -> weight.get(index) * (finalss * x.getFloat(index)));
     }
 
-    static FloatTensor forward(Llama model, State state, int token, int position) {
+    static FloatTensor forward(Llama model, State state, int[] tokens, int position, boolean computeLogits) {
         // a few convenience variables
         Configuration config = model.configuration();
         Weights weights = model.weights();
@@ -942,44 +1774,61 @@ record Llama(Configuration configuration, Tokenizer tokenizer, Weights weights) 
         int kvDim = (config.dim * config.numberOfKeyValueHeads) / config.numberOfHeads;
         int kvMul = config.numberOfHeads / config.numberOfKeyValueHeads; // integer multiplier of the kv sharing in multiquery
         float sqrtHeadSize = (float) Math.sqrt(headSize);
+        final int nTokens = tokens.length;
 
         // copy the token embedding into x
-        weights.token_embedding_table.copyTo(token * dim, state.x, 0, dim);
+        Parallel.parallelFor(0, nTokens, t ->
+            weights.token_embedding_table.copyTo(tokens[t] * dim, state.x[t], 0, dim)
+        );
 
         // forward all the layers
         for (int l = 0; l < config.numberOfLayers; l++) {
             // attention rmsnorm
-            rmsnorm(state.xb, state.x, weights.rms_att_weight[l], dim, config.rmsNormEps);
+            // rmsnorm(state.xb, state.x, weights.rms_att_weight[l], dim, config.rmsNormEps);
+            final int curLayer = l;
+            Parallel.parallelFor(0, nTokens, t ->
+                rmsnorm(state.xb[t], state.x[t], weights.rms_att_weight[curLayer], dim, config.rmsNormEps)
+            );
 
             // qkv matmuls for this position
-            weights.wq[l].matmul(state.xb, state.q, dim, dim);
-            weights.wk[l].matmul(state.xb, state.k, kvDim, dim);
-            weights.wv[l].matmul(state.xb, state.v, kvDim, dim);
+            weights.wq[l].matmul(nTokens, state.xb, state.q, dim, dim);
+            weights.wk[l].matmul(nTokens, state.xb, state.k, kvDim, dim);
+            weights.wv[l].matmul(nTokens, state.xb, state.v, kvDim, dim);
 
             // RoPE relative positional encoding: complex-valued rotate q and k in each head
-            for (int i = 0; i < dim; i += 2) {
-                int head_dim = i % headSize;
-                float fcr = weights.freq_cis_real.get(position * (headSize / 2) + (head_dim / 2));
-                float fci = weights.freq_cis_imag.get(position * (headSize / 2) + (head_dim / 2));
-                int rotn = i < kvDim ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
-                for (int v = 0; v < rotn; v++) {
-                    FloatTensor vec = v == 0 ? state.q : state.k; // the vector to rotate (query or key)
-                    float v0 = vec.getFloat(i);
-                    float v1 = vec.getFloat(i + 1);
-                    vec.setFloat(i, v0 * fcr - v1 * fci);
-                    vec.setFloat(i + 1, v0 * fci + v1 * fcr);
+            Parallel.parallelFor(0, nTokens, t -> {
+                for (int i = 0; i < dim; i += 2) {
+                    int head_dim = i % headSize;
+                    float fcr = weights.freq_cis_real.get((position + t) * (headSize / 2) + (head_dim / 2));
+                    float fci = weights.freq_cis_imag.get((position + t) * (headSize / 2) + (head_dim / 2));
+                    int rotn = i < kvDim ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
+                    for (int vi = 0; vi < rotn; vi++) {
+                        FloatTensor vec = vi == 0 ? state.q[t] : state.k[t]; // the vector to rotate (query or key)
+                        float v0 = vec.getFloat(i);
+                        float v1 = vec.getFloat(i + 1);
+                        vec.setFloat(i, v0 * fcr - v1 * fci);
+                        vec.setFloat(i + 1, v0 * fci + v1 * fcr);
+                    }
                 }
-            }
+            });
 
             // save key,value at this time step (position) to our kv cache
             //int loff = l * config.seq_len * kvDim; // kv cache layer offset for convenience
-            state.k.copyTo(0, state.keyCache[l], position * kvDim, kvDim);
-            state.v.copyTo(0, state.valueCache[l], position * kvDim, kvDim);
+            Parallel.parallelFor(0, nTokens, t -> {
+                state.k[t].copyTo(0, state.keyCache[curLayer], (position + t) * kvDim, kvDim);
+                state.v[t].copyTo(0, state.valueCache[curLayer], (position + t) * kvDim, kvDim);
+            });
 
-            int curLayer = l;
+            // If the logits are not required, the attention and FFN of the last layer can be skipped entirely.
+            if (!computeLogits && curLayer == config.numberOfLayers - 1) {
+                state.idxPrevBlock = nTokens - 1;
+                return null;
+            }
 
             // multihead attention. iterate over all heads
-            Parallel.parallelFor(0, config.numberOfHeads, h -> {
+            Parallel.parallelForLong(0, (long) nTokens * (long) config.numberOfHeads, ht -> {
+                int token = (int) (ht / config.numberOfHeads);
+                int h = (int) (ht % config.numberOfHeads);
                 // get the query vector for this head
                 // float* q = s.q + h * headSize;
                 int qOffset = h * headSize;
@@ -989,70 +1838,83 @@ record Llama(Configuration configuration, Tokenizer tokenizer, Weights weights) 
                 int attOffset = h * config.contextLength;
 
                 // iterate over all timesteps, including the current one
-                for (int t = 0; t <= position; t++) {
+                for (int t = 0; t <= position + token; t++) {
                     // get the key vector for this head and at this timestep
                     // float* k = s.key_cache + loff + t * dim + h * headSize;
                     int keyCacheOffset = /* loff + */ t * kvDim + (h / kvMul) * headSize;
                     // calculate the attention score as the dot product of q and k
-                    float score = state.q.dot(qOffset, state.keyCache[curLayer], keyCacheOffset, headSize);
+                    float score = state.q[token].dot(qOffset, state.keyCache[curLayer], keyCacheOffset, headSize);
                     score /= sqrtHeadSize;
                     // save the score to the attention buffer
-                    state.att.setFloat(attOffset + t, score);
+                    state.att[token].setFloat(attOffset + t, score);
                 }
 
                 // softmax the scores to get attention weights, from 0..position inclusively
-                state.att.softmaxInPlace(attOffset, position + 1);
+                state.att[token].softmaxInPlace(attOffset, position + token + 1);
 
                 // weighted sum of the values, store back into xb
                 // float* xb = s.xb + h * headSize;
                 int xbOffset = h * headSize;
                 // memset(xb, 0, headSize * sizeof(float));
-                state.xb.fillInPlace(xbOffset, headSize, 0f);
+                state.xb[token].fillInPlace(xbOffset, headSize, 0f);
 
-                for (int t = 0; t <= position; t++) {
+                for (int t = 0; t <= position + token; t++) {
                     // get the value vector for this head and at this timestep
                     // float* v = s.value_cache + loff + t * dim + h * headSize;
                     int vOffset = /* loff + */ t * kvDim + (h / kvMul) * headSize;
                     // get the attention weight for this timestep
-                    float a = state.att.getFloat(attOffset + t);
+                    float a = state.att[token].getFloat(attOffset + t);
                     // accumulate the weighted value into xb
-                    state.xb.saxpyInPlace(xbOffset, state.valueCache[curLayer], vOffset, headSize, a);
+                    state.xb[token].saxpyInPlace(xbOffset, state.valueCache[curLayer], vOffset, headSize, a);
                 }
             });
 
             // final matmul to get the output of the attention
-            weights.wo[l].matmul(state.xb, state.xb2, dim, dim);
+            weights.wo[l].matmul(nTokens, state.xb, state.xb2, dim, dim);
 
             // residual connection back into x
-            state.x.addInPlace(state.xb2);
+            Parallel.parallelFor(0, nTokens, t -> {
+                state.x[t].addInPlace(state.xb2[t]);
+            });
 
             // ffn rmsnorm
-            rmsnorm(state.xb, state.x, weights.rms_ffn_weight[l], dim, config.rmsNormEps);
+            Parallel.parallelFor(0, nTokens, t -> {
+                rmsnorm(state.xb[t], state.x[t], weights.rms_ffn_weight[curLayer], dim, config.rmsNormEps);
+            });
 
             // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
             // first calculate self.w1(x) and self.w3(x)
-            weights.w1[l].matmul(state.xb, state.hb, config.hiddenDim, dim);
-            weights.w3[l].matmul(state.xb, state.hb2, config.hiddenDim, dim);
+            weights.w1[l].matmul(nTokens, state.xb, state.hb, config.hiddenDim, dim);
+            weights.w3[l].matmul(nTokens, state.xb, state.hb2, config.hiddenDim, dim);
 
             // SwiGLU non-linearity
             // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
-            state.hb.mapInPlace(value -> value / (float) (1.0 + Math.exp(-value)));
+            Parallel.parallelFor(0, nTokens, t -> {
+                state.hb[t].mapInPlace(value -> value / (float) (1.0 + Math.exp(-value)));
+            });
 
             // elementwise multiply with w3(x)
-            state.hb.multiplyInPlace(state.hb2);
+            Parallel.parallelFor(0, nTokens, t -> {
+                state.hb[t].multiplyInPlace(state.hb2[t]);
+            });
 
             // final matmul to get the output of the ffn
-            weights.w2[l].matmul(state.hb, state.xb, dim, config.hiddenDim);
+            weights.w2[l].matmul(nTokens, state.hb, state.xb, dim, config.hiddenDim);
 
             // residual connection
-            state.x.addInPlace(state.xb);
+            Parallel.parallelFor(0, nTokens, t -> {
+                state.x[t].addInPlace(state.xb[t]);
+            });
         }
 
         // final rmsnorm
-        rmsnorm(state.x, state.x, weights.rms_final_weight, dim, config.rmsNormEps);
+        Parallel.parallelFor(0, nTokens, t -> {
+            rmsnorm(state.x[t], state.x[t], weights.rms_final_weight, dim, config.rmsNormEps);
+        });
 
         // classifier into logits
-        weights.wcls.matmul(state.x, state.logits, config.vocabularySize, dim);
+        weights.wcls.matmul(state.x[nTokens - 1], state.logits, config.vocabularySize, dim);
+        state.idxPrevBlock = nTokens - 1;
 
         return state.logits;
     }
@@ -1079,6 +1941,7 @@ record Llama(Configuration configuration, Tokenizer tokenizer, Weights weights) 
     public static List<Integer> generateTokens(Llama model, State state, int startPosition, List<Integer> promptTokens, Set<Integer> stopTokens, int maxTokens, Sampler sampler, boolean echo,
                                                IntConsumer onTokenGenerated) {
         long startNanos = System.nanoTime();
+        long startGen = 0;
         if (maxTokens < 0 || model.configuration().contextLength < maxTokens) {
             maxTokens = model.configuration().contextLength;
         }
@@ -1087,34 +1950,52 @@ record Llama(Configuration configuration, Tokenizer tokenizer, Weights weights) 
         int nextToken;
         int promptIndex = 0;
         for (int position = startPosition; position < maxTokens; ++position) {
-            forward(model, state, token, position);
             if (promptIndex < promptTokens.size()) {
-                // Force-pick token from prompt.
-                nextToken = promptTokens.get(promptIndex++);
-                if (echo) {
-                    // log prompt token (different color?)
-                    System.err.print(Tokenizer.replaceControlCharacters(model.tokenizer().decode(List.of(nextToken))));
+                final int nTokens = Math.min(maxTokens - position, Math.min(promptTokens.size() - promptIndex, state.batchsize));
+                final int[] tokens = new int[nTokens];
+                for (int i = 0; i < nTokens; i++) {
+                    tokens[i] = promptTokens.get(promptIndex + i);
+                    if (echo) {
+                        // log prompt token (different color?)
+                        System.err.print(Tokenizer.replaceControlCharacters(model.tokenizer().decode(List.of(tokens[i]))));
+                    }
                 }
+                if (echo) {
+                    System.out.format("position=%d, promptIdx=%d, promptSize=%d, tokens=%s%n", position, promptIndex, promptTokens.size(), Arrays.toString(tokens));
+                }
+                // Only compute logits on the very last batch.
+                boolean computeLogits = promptIndex + nTokens >= promptTokens.size();
+                forward(model, state, tokens, position, computeLogits);
+                position += nTokens - 1; // -1 -> incremented later in the for loop
+                promptIndex += nTokens;
+                if (promptIndex < promptTokens.size()) {
+                    continue;
+                }
+                startGen = System.nanoTime();
             } else {
-                nextToken = sampler.sampleToken(state.logits);
-                if (echo) {
-                    // log inferred token
-                    System.err.print(Tokenizer.replaceControlCharacters(model.tokenizer().decode(List.of(nextToken))));
-                }
-                generatedTokens.add(nextToken);
-                if (onTokenGenerated != null) {
-                    onTokenGenerated.accept(nextToken);
-                }
-                if (stopTokens.contains(nextToken)) {
-                    break;
-                }
+                forward(model, state, new int[]{token}, position, true);
+            }
+            nextToken = sampler.sampleToken(state.logits);
+            if (echo) {
+                // log inferred token
+                System.err.print(Tokenizer.replaceControlCharacters(model.tokenizer().decode(List.of(nextToken))));
+            }
+            generatedTokens.add(nextToken);
+            if (onTokenGenerated != null) {
+                onTokenGenerated.accept(nextToken);
+            }
+            if (stopTokens.contains(nextToken)) {
+                break;
             }
             state.latestToken = token = nextToken;
         }
 
         long elapsedNanos = System.nanoTime() - startNanos;
-        int totalTokens = promptIndex + generatedTokens.size();
-        System.err.printf("%n%.2f tokens/s (%d)%n", totalTokens / (elapsedNanos / 1_000_000_000.0), totalTokens);
+        long promptNanos = startGen - startNanos;
+        long genNanos = elapsedNanos - startGen + startNanos;
+        System.err.printf("%nprompt: %.2f tokens/s (%d) generation: %.2f tokens/s (%d)%n",
+                promptTokens.size() / (promptNanos / 1_000_000_000.0), promptTokens.size(),
+                generatedTokens.size() / (genNanos / 1_000_000_000.0), generatedTokens.size());
 
         return generatedTokens;
     }
@@ -1373,7 +2254,19 @@ class Tokenizer {
 
 final class Parallel {
     public static void parallelFor(int startInclusive, int endExclusive, IntConsumer action) {
+        if (startInclusive == 0 && endExclusive == 1) {
+            action.accept(0);
+            return;
+        }
         IntStream.range(startInclusive, endExclusive).parallel().forEach(action);
+    }
+
+    public static void parallelForLong(long startInclusive, long endExclusive, LongConsumer action) {
+        if (startInclusive == 0 && endExclusive == 1) {
+            action.accept(0);
+            return;
+        }
+        LongStream.range(startInclusive, endExclusive).parallel().forEach(action);
     }
 }
 
@@ -1460,11 +2353,11 @@ enum GGMLType {
  * e.g. can represent a sequence of quantized floats.
  */
 abstract class FloatTensor {
-    static final boolean USE_VECTOR_API = Boolean.parseBoolean(System.getProperty("llama.VectorAPI", "true"));
+    static final int VECTOR_BIT_SIZE = Integer.getInteger("llama.VectorBitSize", VectorShape.preferredShape().vectorBitSize());
+    static final boolean USE_VECTOR_API = VECTOR_BIT_SIZE != 0;
 
     // static final ValueLayout.OfFloat JAVA_FLOAT_LE = ValueLayout.JAVA_FLOAT.withOrder(ByteOrder.LITTLE_ENDIAN);
     // static final ValueLayout.OfShort JAVA_SHORT_LE = ValueLayout.JAVA_SHORT.withOrder(ByteOrder.LITTLE_ENDIAN);
-
 
     // The use of Unsafe in this file is a temporary workaround to support native-image.
     static final Unsafe UNSAFE;
@@ -1491,7 +2384,9 @@ abstract class FloatTensor {
 
     // Preferred vector size for the fast multiplication routines.
     // (Apple Silicon) NEON only supports up-to 128bit vectors.
-    static final VectorSpecies<Float> F_SPECIES = FloatVector.SPECIES_PREFERRED.vectorBitSize() == 128 ? FloatVector.SPECIES_128 : FloatVector.SPECIES_256;
+    static final VectorSpecies<Float> F_SPECIES = USE_VECTOR_API
+            ? VectorShape.forBitSize(VECTOR_BIT_SIZE).withLanes(float.class)
+            : null;
 
     abstract int size();
 
@@ -1522,6 +2417,17 @@ abstract class FloatTensor {
 
     void matmul(FloatTensor that, FloatTensor out, int dim0, int dim1) {
         Parallel.parallelFor(0, dim0, i -> out.setFloat(i, dot(i * dim1, that, 0, dim1)));
+    }
+
+    void matmul(int context, FloatTensor[] that, FloatTensor[] out, int dim0, int dim1) {
+        if (that.length != out.length) {
+            throw new IllegalArgumentException(String.format("that.len=%d, out.len=%d", that.length, out.length));
+        }
+        Parallel.parallelForLong(0, dim0 * context, ti -> {
+            int idxArr = (int) (ti / dim0);
+            int i = (int) (ti % dim0);
+            out[idxArr].setFloat(i, dot(i * dim1, that[idxArr], 0, dim1)); 
+        });
     }
 
     @FunctionalInterface
@@ -1723,28 +2629,34 @@ final class Q4_0FloatTensor extends FloatTensor {
         for (; j < upperBound; j += GGMLType.Q4_0.getBlockSize(), blockOffset += GGMLType.Q4_0.getTypeSize()) {
             float wScaleValue = Float.float16ToFloat(readShort(thiz.memorySegment, blockOffset));
             var wScale = FloatVector.broadcast(F_SPECIES, wScaleValue);
-            var B_SPECIES = ByteVector.SPECIES_128;
-            var wBytes = ByteVector.fromMemorySegment(B_SPECIES, thiz.memorySegment, blockOffset + Float16.BYTES, ByteOrder.LITTLE_ENDIAN);
+            var wBytes = ByteVector.fromMemorySegment(ByteVector.SPECIES_128, thiz.memorySegment, blockOffset + Float16.BYTES, ByteOrder.LITTLE_ENDIAN);
             var loBytes = wBytes.and((byte) 0xF).sub((byte) 8);
             var hiBytes = wBytes.lanewise(VectorOperators.LSHR, 4).sub((byte) 8);
-            if (F_SPECIES.vectorBitSize() == 256) {
-                var sum0 = that.getFloatVector(F_SPECIES, thatOffset + j + 0 * F_SPECIES.length()).mul(loBytes.castShape(F_SPECIES, 0));
-                var sum1 = that.getFloatVector(F_SPECIES, thatOffset + j + 1 * F_SPECIES.length()).mul(loBytes.castShape(F_SPECIES, 1));
-                var sum2 = that.getFloatVector(F_SPECIES, thatOffset + j + 2 * F_SPECIES.length()).mul(hiBytes.castShape(F_SPECIES, 0));
-                var sum3 = that.getFloatVector(F_SPECIES, thatOffset + j + 3 * F_SPECIES.length()).mul(hiBytes.castShape(F_SPECIES, 1));
-                val = sum0.add(sum1).add(sum2).add(sum3).fma(wScale, val);
-            } else if (F_SPECIES.vectorBitSize() == 128) {
-                // This loop cannot be unrolled, why?
-                for (int i = 0; i < 2; ++i) {
-                    var tmp = i == 0 ? loBytes : hiBytes;
-                    var sum0 = that.getFloatVector(F_SPECIES, thatOffset + j + (i * 4 + 0) * F_SPECIES.length()).mul(tmp.castShape(F_SPECIES, 0));
-                    var sum1 = that.getFloatVector(F_SPECIES, thatOffset + j + (i * 4 + 1) * F_SPECIES.length()).mul(tmp.castShape(F_SPECIES, 1));
-                    var sum2 = that.getFloatVector(F_SPECIES, thatOffset + j + (i * 4 + 2) * F_SPECIES.length()).mul(tmp.castShape(F_SPECIES, 2));
-                    var sum3 = that.getFloatVector(F_SPECIES, thatOffset + j + (i * 4 + 3) * F_SPECIES.length()).mul(tmp.castShape(F_SPECIES, 3));
+            switch (F_SPECIES.vectorBitSize()) {
+                case 512 -> {
+                    var sum0 = that.getFloatVector(F_SPECIES, thatOffset + j + 0 * F_SPECIES.length()).mul(loBytes.castShape(F_SPECIES, 0));
+                    var sum2 = that.getFloatVector(F_SPECIES, thatOffset + j + 1 * F_SPECIES.length()).mul(hiBytes.castShape(F_SPECIES, 0));
+                    val = sum0.add(sum2).fma(wScale, val);
+                }
+                case 256 -> {
+                    var sum0 = that.getFloatVector(F_SPECIES, thatOffset + j + 0 * F_SPECIES.length()).mul(loBytes.castShape(F_SPECIES, 0));
+                    var sum1 = that.getFloatVector(F_SPECIES, thatOffset + j + 1 * F_SPECIES.length()).mul(loBytes.castShape(F_SPECIES, 1));
+                    var sum2 = that.getFloatVector(F_SPECIES, thatOffset + j + 2 * F_SPECIES.length()).mul(hiBytes.castShape(F_SPECIES, 0));
+                    var sum3 = that.getFloatVector(F_SPECIES, thatOffset + j + 3 * F_SPECIES.length()).mul(hiBytes.castShape(F_SPECIES, 1));
                     val = sum0.add(sum1).add(sum2).add(sum3).fma(wScale, val);
                 }
-            } else {
-                throw new UnsupportedOperationException(F_SPECIES.toString());
+                case 128 -> {
+                    // This loop cannot be unrolled, why?
+                    for (int i = 0; i < 2; ++i) {
+                        var tmp = i == 0 ? loBytes : hiBytes;
+                        var sum0 = that.getFloatVector(F_SPECIES, thatOffset + j + (i * 4 + 0) * F_SPECIES.length()).mul(tmp.castShape(F_SPECIES, 0));
+                        var sum1 = that.getFloatVector(F_SPECIES, thatOffset + j + (i * 4 + 1) * F_SPECIES.length()).mul(tmp.castShape(F_SPECIES, 1));
+                        var sum2 = that.getFloatVector(F_SPECIES, thatOffset + j + (i * 4 + 2) * F_SPECIES.length()).mul(tmp.castShape(F_SPECIES, 2));
+                        var sum3 = that.getFloatVector(F_SPECIES, thatOffset + j + (i * 4 + 3) * F_SPECIES.length()).mul(tmp.castShape(F_SPECIES, 3));
+                        val = sum0.add(sum1).add(sum2).add(sum3).fma(wScale, val);
+                    }
+                }
+                default -> throw new UnsupportedOperationException(F_SPECIES.toString());
             }
         }
         result += val.reduceLanes(VectorOperators.ADD);
@@ -1829,26 +2741,33 @@ final class Q8_0FloatTensor extends FloatTensor {
         for (; j < upperBound; j += GGMLType.Q8_0.getBlockSize(), blockOffset += GGMLType.Q8_0.getTypeSize()) {
             float wScaleValue = Float.float16ToFloat(readShort(thiz.memorySegment, blockOffset));
             var wScale = FloatVector.broadcast(F_SPECIES, wScaleValue);
-            if (F_SPECIES.vectorBitSize() == 256) {
-                var wBytes = ByteVector.fromMemorySegment(ByteVector.SPECIES_256, thiz.memorySegment, blockOffset + Float16.BYTES, ByteOrder.LITTLE_ENDIAN);
-                var sum0 = that.getFloatVector(F_SPECIES, thatOffset + j + 0 * F_SPECIES.length()).mul(wBytes.castShape(F_SPECIES, 0));
-                var sum1 = that.getFloatVector(F_SPECIES, thatOffset + j + 1 * F_SPECIES.length()).mul(wBytes.castShape(F_SPECIES, 1));
-                var sum2 = that.getFloatVector(F_SPECIES, thatOffset + j + 2 * F_SPECIES.length()).mul(wBytes.castShape(F_SPECIES, 2));
-                var sum3 = that.getFloatVector(F_SPECIES, thatOffset + j + 3 * F_SPECIES.length()).mul(wBytes.castShape(F_SPECIES, 3));
-                val = sum0.add(sum1).add(sum2).add(sum3).fma(wScale, val);
-            } else if (F_SPECIES.vectorBitSize() == 128) {
-                VectorSpecies<Byte> B_128 = ByteVector.SPECIES_128;
-                // This loop cannot be unrolled, why?
-                for (int i = 0; i < 2; ++i) {
-                    var wBytes = ByteVector.fromMemorySegment(B_128, thiz.memorySegment, blockOffset + Float16.BYTES + i * B_128.vectorByteSize(), ByteOrder.LITTLE_ENDIAN);
-                    var sum0 = that.getFloatVector(F_SPECIES, thatOffset + j + i * 16 + 0 * F_SPECIES.length()).mul(wBytes.castShape(F_SPECIES, 0));
-                    var sum1 = that.getFloatVector(F_SPECIES, thatOffset + j + i * 16 + 1 * F_SPECIES.length()).mul(wBytes.castShape(F_SPECIES, 1));
-                    var sum2 = that.getFloatVector(F_SPECIES, thatOffset + j + i * 16 + 2 * F_SPECIES.length()).mul(wBytes.castShape(F_SPECIES, 2));
-                    var sum3 = that.getFloatVector(F_SPECIES, thatOffset + j + i * 16 + 3 * F_SPECIES.length()).mul(wBytes.castShape(F_SPECIES, 3));
+            switch (F_SPECIES.vectorBitSize()) {
+                case 512 -> {
+                    var wBytes = ByteVector.fromMemorySegment(ByteVector.SPECIES_256, thiz.memorySegment, blockOffset + Float16.BYTES, ByteOrder.LITTLE_ENDIAN);
+                    var sum0 = that.getFloatVector(F_SPECIES, thatOffset + j + 0 * F_SPECIES.length()).mul(wBytes.castShape(F_SPECIES, 0));
+                    var sum1 = that.getFloatVector(F_SPECIES, thatOffset + j + 1 * F_SPECIES.length()).mul(wBytes.castShape(F_SPECIES, 1));
+                    val = sum0.add(sum1).fma(wScale, val);
+                }
+                case 256 -> {
+                    var wBytes = ByteVector.fromMemorySegment(ByteVector.SPECIES_256, thiz.memorySegment, blockOffset + Float16.BYTES, ByteOrder.LITTLE_ENDIAN);
+                    var sum0 = that.getFloatVector(F_SPECIES, thatOffset + j + 0 * F_SPECIES.length()).mul(wBytes.castShape(F_SPECIES, 0));
+                    var sum1 = that.getFloatVector(F_SPECIES, thatOffset + j + 1 * F_SPECIES.length()).mul(wBytes.castShape(F_SPECIES, 1));
+                    var sum2 = that.getFloatVector(F_SPECIES, thatOffset + j + 2 * F_SPECIES.length()).mul(wBytes.castShape(F_SPECIES, 2));
+                    var sum3 = that.getFloatVector(F_SPECIES, thatOffset + j + 3 * F_SPECIES.length()).mul(wBytes.castShape(F_SPECIES, 3));
                     val = sum0.add(sum1).add(sum2).add(sum3).fma(wScale, val);
                 }
-            } else {
-                throw new UnsupportedOperationException(F_SPECIES.toString());
+                case 128 -> {
+                    // This loop cannot be unrolled, why?
+                    for (int i = 0; i < 2; ++i) {
+                        var wBytes = ByteVector.fromMemorySegment(ByteVector.SPECIES_128, thiz.memorySegment, blockOffset + Float16.BYTES + i * ByteVector.SPECIES_128.vectorByteSize(), ByteOrder.LITTLE_ENDIAN);
+                        var sum0 = that.getFloatVector(F_SPECIES, thatOffset + j + i * 16 + 0 * F_SPECIES.length()).mul(wBytes.castShape(F_SPECIES, 0));
+                        var sum1 = that.getFloatVector(F_SPECIES, thatOffset + j + i * 16 + 1 * F_SPECIES.length()).mul(wBytes.castShape(F_SPECIES, 1));
+                        var sum2 = that.getFloatVector(F_SPECIES, thatOffset + j + i * 16 + 2 * F_SPECIES.length()).mul(wBytes.castShape(F_SPECIES, 2));
+                        var sum3 = that.getFloatVector(F_SPECIES, thatOffset + j + i * 16 + 3 * F_SPECIES.length()).mul(wBytes.castShape(F_SPECIES, 3));
+                        val = sum0.add(sum1).add(sum2).add(sum3).fma(wScale, val);
+                    }
+                }
+                default -> throw new UnsupportedOperationException(F_SPECIES.toString());
             }
         }
         result += val.reduceLanes(VectorOperators.ADD);
@@ -2185,7 +3104,7 @@ final class AOT {
             try (FileChannel fileChannel = FileChannel.open(path, StandardOpenOption.READ)) {
                 return new PartialModel(
                         path.getFileName().toString(),
-                        ModelLoader.loadModel(fileChannel, gguf, Llama3.Options.DEFAULT_MAX_TOKENS, false),
+                        ModelLoader.loadModel(path, fileChannel, gguf, Llama3.Options.DEFAULT_MAX_TOKENS, false),
                         gguf.getTensorDataOffset(),
                         gguf.getTensorInfos()
                 );
@@ -2217,7 +3136,8 @@ final class AOT {
             // Load only the tensors (mmap slices).
             Map<String, GGMLTensorEntry> tensorEntries = GGUF.loadTensors(fileChannel, preLoaded.tensorDataOffset(), preLoaded.tensorInfos());
             Llama.Weights weights = ModelLoader.loadWeights(tensorEntries, baseModel.configuration());
-            return new Llama(baseModel.configuration().withContextLength(contextLength), baseModel.tokenizer(), weights);
+            return new Llama(modelPath.getFileName().toString().replaceFirst(".gguf$",  ""),
+                    baseModel.configuration().withContextLength(contextLength), baseModel.tokenizer(), weights);
         }
     }
 }
